@@ -1,6 +1,7 @@
-streamlit==1.28.0
-requests==2.31.0
-dnspython==2.4.2
-python-whois==0.8.0
-pyOpenSSL==23.2.0
-urllib3==1.26.18
+# Gunakan versi yang sudah teruji stabil di Streamlit Cloud
+streamlit>=1.28.0,<2.0.0
+requests>=2.28.0
+
+# Hapus package yang bermasalah - gunakan alternatif:
+# Untuk SSL check - sudah built-in, tidak perlu install
+# Untuk DNS - opsional, bisa di-skip dulu
