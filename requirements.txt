@@ -1,4 +1,4 @@
 streamlit
 requests
-dnspython
-python-whois
+numpy
+scikit-learn
