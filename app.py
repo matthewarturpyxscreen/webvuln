@@ -2,33 +2,26 @@ import streamlit as st
 import requests
 import re
 import random
-from urllib.parse import urljoin, urlparse, quote
+import time
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title="🔥 Cyber Scanner", layout="wide")
+st.set_page_config(page_title="🧠 Ultra AI Scanner", layout="wide")
 
 MAX_THREADS = 8
-
-COMMON_SUBDOMAINS = ["admin", "dev", "test", "api", "staging"]
-COMMON_CREDS = [("admin", "admin"), ("admin", "1234"), ("test", "test")]
+CRAWL_LIMIT = 20
 
 USER_AGENTS = [
     "Mozilla/5.0",
     "Chrome/120.0",
 ]
 
-# ================= SUBDOMAIN =================
-def find_subdomains(domain):
-    found = []
-    for sub in COMMON_SUBDOMAINS:
-        url = f"http://{sub}.{domain}"
-        try:
-            r = requests.get(url, timeout=3)
-            if r.status_code < 400:
-                found.append(url)
-        except:
-            pass
-    return found
+PARAMS = ["id", "q", "search", "page"]
+
+# ================= FILTER =================
+def is_valid_target(url):
+    blocked = (".css", ".js", ".png", ".jpg", ".jpeg", ".svg", ".ico")
+    return not url.lower().endswith(blocked)
 
 # ================= CRAWLER =================
 def crawl(url):
@@ -37,127 +30,165 @@ def crawl(url):
 
     base = urlparse(url).netloc
 
-    while to_visit and len(visited) < 15:
+    while to_visit and len(visited) < CRAWL_LIMIT:
         u = to_visit.pop(0)
+
         if u in visited:
             continue
 
         visited.add(u)
 
         try:
-            r = requests.get(u, timeout=3)
+            r = requests.get(u, timeout=5)
             links = re.findall(r'href=["\'](.*?)["\']', r.text)
 
             for link in links:
                 full = urljoin(u, link)
-                if urlparse(full).netloc == base:
+
+                if urlparse(full).netloc == base and is_valid_target(full):
                     to_visit.append(full)
         except:
             pass
 
     return list(visited)
 
-# ================= AI DETECTION =================
-def ai_score(text, delay):
+# ================= PARAM DISCOVERY =================
+def discover_params(url):
+    found = []
+
+    for p in PARAMS:
+        test_url = f"{url}?{p}=test"
+        try:
+            r = requests.get(test_url, timeout=5)
+            if "test" in r.text:
+                found.append(p)
+        except:
+            pass
+
+    return found
+
+# ================= AI ANALYSIS =================
+def analyze(base, test):
     score = 0
+    reasons = []
 
-    if "sql" in text.lower():
-        score += 3
-    if "<script>" in text:
+    # panjang berubah
+    if abs(len(test.text) - len(base.text)) > 100:
         score += 2
-    if delay > 2:
-        score += 2
+        reasons.append("Response size changed")
 
-    return score
+    # status berubah
+    if base.status_code != test.status_code:
+        score += 2
+        reasons.append("Status changed")
+
+    # delay
+    if test.elapsed.total_seconds() > base.elapsed.total_seconds() * 2:
+        score += 2
+        reasons.append("Delay anomaly")
+
+    # error nyata
+    errors = ["sql syntax", "mysql", "error in your query"]
+    for e in errors:
+        if e in test.text.lower():
+            score += 3
+            reasons.append("SQL error detected")
+
+    return score, reasons
 
 # ================= SCAN =================
 def scan(url):
+    if not is_valid_target(url):
+        return []
+
     session = requests.Session()
     session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
 
     findings = []
 
-    payloads = [
-        "' OR 1=1 --",
-        "<script>alert(1)</script>"
-    ]
-
     try:
-        base = session.get(url, timeout=3)
-        base_time = base.elapsed.total_seconds()
+        base = session.get(url, timeout=5)
 
-        for p in payloads:
-            test_url = f"{url}?q={quote(p)}"
-            r = session.get(test_url, timeout=3)
+        params = discover_params(url)
+        if not params:
+            params = ["q"]
 
-            score = ai_score(r.text, r.elapsed.total_seconds())
+        payloads = [
+            "' OR 1=1 --",
+            "<script>alert(1)</script>"
+        ]
 
-            if score > 0:
-                findings.append((url, p, score))
+        for param in params:
+            for p in payloads:
+                test_url = f"{url}?{param}={quote(p)}"
+
+                try:
+                    r = session.get(test_url, timeout=5)
+
+                    score, reasons = analyze(base, r)
+
+                    if score >= 3:
+                        findings.append({
+                            "url": url,
+                            "param": param,
+                            "payload": p,
+                            "score": score,
+                            "reasons": reasons
+                        })
+
+                except:
+                    pass
+
     except:
         pass
 
     return findings
 
-# ================= LOGIN TEST =================
-def test_login(url):
-    results = []
-    for u, p in COMMON_CREDS:
-        try:
-            r = requests.post(url, data={"username": u, "password": p}, timeout=3)
-            if "dashboard" in r.text.lower():
-                results.append((u, p))
-        except:
-            pass
-    return results
-
 # ================= MAIN =================
 def main():
-    st.title("🔥 AI Cyber Scanner LEVEL UP")
+    st.title("🧠 ULTRA INTELLIGENCE SCANNER")
 
     target = st.text_input("Target URL")
 
-    if st.button("🚀 START ATTACK (SAFE MODE)"):
+    if st.button("🚀 Scan Ultra"):
         if not target:
+            st.warning("Masukkan URL")
             return
 
         if not target.startswith("http"):
             target = "https://" + target
 
-        domain = urlparse(target).netloc
+        st.write("## 🕷️ Crawling...")
+        urls = crawl(target)
 
-        st.write("## 🌐 Subdomain Scan")
-        subs = find_subdomains(domain)
-        st.write(subs)
+        st.success(f"{len(urls)} halaman valid")
 
-        st.write("## 🕷️ Crawling")
-        urls = crawl(target) + subs
-        st.write(f"{len(urls)} URLs ditemukan")
-
-        st.write("## ⚡ Scanning")
+        st.write("## ⚡ Smart Scanning...")
 
         findings = []
 
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as exe:
-            futures = [exe.submit(scan, u) for u in urls]
+        progress = st.progress(0)
 
-            for f in as_completed(futures):
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = [executor.submit(scan, u) for u in urls]
+
+            for i, f in enumerate(as_completed(futures)):
                 findings.extend(f.result())
+                progress.progress((i + 1) / len(futures))
 
-        st.write("## 💣 Vulnerabilities")
+        st.write("## 💣 Findings")
+
         if findings:
             for f in findings:
-                st.error(f)
+                st.error(f"""
+URL: {f['url']}
+Param: {f['param']}
+Payload: {f['payload']}
+Score: {f['score']}
+Reason: {", ".join(f['reasons'])}
+                """)
         else:
-            st.success("Aman")
-
-        st.write("## 🔐 Login Test (basic)")
-        login_results = test_login(target)
-
-        if login_results:
-            st.error(login_results)
-        else:
-            st.success("Login aman")
+            st.success("Tidak ditemukan vulnerability signifikan 🎉")
 
 if __name__ == "__main__":
     main()
