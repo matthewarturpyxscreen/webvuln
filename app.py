@@ -1,164 +1,163 @@
 import streamlit as st
 import requests
-import ssl
-import socket
-import json
-import random
-import time
-import hashlib
 import re
-from datetime import datetime
-from urllib.parse import urlparse, quote
-import base64
-import concurrent.futures
-from collections import defaultdict
+import random
+from urllib.parse import urljoin, urlparse, quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Safe import
-try:
-    import dns.resolver
-except ImportError:
-    dns = None
+st.set_page_config(page_title="🔥 Cyber Scanner", layout="wide")
 
-try:
-    import whois
-except ImportError:
-    whois = None
+MAX_THREADS = 8
 
+COMMON_SUBDOMAINS = ["admin", "dev", "test", "api", "staging"]
+COMMON_CREDS = [("admin", "admin"), ("admin", "1234"), ("test", "test")]
 
-# ================= PAGE CONFIG =================
-st.set_page_config(
-    page_title="Advanced Security Scanner",
-    page_icon="🛡️",
-    layout="wide"
-)
+USER_AGENTS = [
+    "Mozilla/5.0",
+    "Chrome/120.0",
+]
 
-# ================= ANONYMITY =================
-class AnonymousScanner:
-    def __init__(self):
-        self.user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
-            'Mozilla/5.0 (X11; Linux x86_64)',
-        ]
-
-    def get_session(self):
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': random.choice(self.user_agents)
-        })
-        time.sleep(random.uniform(0.5, 1.5))
-        return session
-
-
-# ================= EXPLOIT DETECTOR =================
-class ExploitDetector:
-    def __init__(self):
-        self.sql_patterns = [
-            (r"SQL syntax", "SQL Injection"),
-            (r"mysql_", "SQL Injection"),
-        ]
-
-    def test_sql_injection(self, url, session):
-        findings = []
-        payloads = ["'", "' OR 1=1 --"]
-
-        for payload in payloads:
-            try:
-                r = session.get(f"{url}?id={quote(payload)}", timeout=5)
-                for pattern, name in self.sql_patterns:
-                    if re.search(pattern, r.text, re.IGNORECASE):
-                        findings.append(name)
-            except:
-                pass
-        return findings
-
-
-# ================= STANDARD SCANNER =================
-class SecurityScanner:
-    def __init__(self):
-        self.session = requests.Session()
-
-    def check_ssl(self, domain):
+# ================= SUBDOMAIN =================
+def find_subdomains(domain):
+    found = []
+    for sub in COMMON_SUBDOMAINS:
+        url = f"http://{sub}.{domain}"
         try:
-            context = ssl.create_default_context()
-            with socket.create_connection((domain, 443), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                    cert = ssock.getpeercert()
-                    expiry = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
-                    days = (expiry - datetime.now()).days
-                    return {"valid": True, "days": days}
-        except Exception as e:
-            return {"valid": False, "error": str(e)}
-
-    def check_headers(self, url):
-        try:
-            r = self.session.get(url, timeout=5)
-            return dict(r.headers)
+            r = requests.get(url, timeout=3)
+            if r.status_code < 400:
+                found.append(url)
         except:
-            return {}
+            pass
+    return found
 
+# ================= CRAWLER =================
+def crawl(url):
+    visited = set()
+    to_visit = [url]
+
+    base = urlparse(url).netloc
+
+    while to_visit and len(visited) < 15:
+        u = to_visit.pop(0)
+        if u in visited:
+            continue
+
+        visited.add(u)
+
+        try:
+            r = requests.get(u, timeout=3)
+            links = re.findall(r'href=["\'](.*?)["\']', r.text)
+
+            for link in links:
+                full = urljoin(u, link)
+                if urlparse(full).netloc == base:
+                    to_visit.append(full)
+        except:
+            pass
+
+    return list(visited)
+
+# ================= AI DETECTION =================
+def ai_score(text, delay):
+    score = 0
+
+    if "sql" in text.lower():
+        score += 3
+    if "<script>" in text:
+        score += 2
+    if delay > 2:
+        score += 2
+
+    return score
+
+# ================= SCAN =================
+def scan(url):
+    session = requests.Session()
+    session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+
+    findings = []
+
+    payloads = [
+        "' OR 1=1 --",
+        "<script>alert(1)</script>"
+    ]
+
+    try:
+        base = session.get(url, timeout=3)
+        base_time = base.elapsed.total_seconds()
+
+        for p in payloads:
+            test_url = f"{url}?q={quote(p)}"
+            r = session.get(test_url, timeout=3)
+
+            score = ai_score(r.text, r.elapsed.total_seconds())
+
+            if score > 0:
+                findings.append((url, p, score))
+    except:
+        pass
+
+    return findings
+
+# ================= LOGIN TEST =================
+def test_login(url):
+    results = []
+    for u, p in COMMON_CREDS:
+        try:
+            r = requests.post(url, data={"username": u, "password": p}, timeout=3)
+            if "dashboard" in r.text.lower():
+                results.append((u, p))
+        except:
+            pass
+    return results
 
 # ================= MAIN =================
 def main():
-    st.title("🛡️ Web Security Scanner")
+    st.title("🔥 AI Cyber Scanner LEVEL UP")
 
-    url = st.text_input("Target URL")
+    target = st.text_input("Target URL")
 
-    if st.button("Scan"):
-        if not url:
-            st.warning("Masukkan URL dulu")
+    if st.button("🚀 START ATTACK (SAFE MODE)"):
+        if not target:
             return
 
-        if not url.startswith("http"):
-            url = "https://" + url
+        if not target.startswith("http"):
+            target = "https://" + target
 
-        domain = urlparse(url).netloc
+        domain = urlparse(target).netloc
 
-        scanner = SecurityScanner()
-        anon = AnonymousScanner()
-        exploit = ExploitDetector()
+        st.write("## 🌐 Subdomain Scan")
+        subs = find_subdomains(domain)
+        st.write(subs)
 
-        session = anon.get_session()
+        st.write("## 🕷️ Crawling")
+        urls = crawl(target) + subs
+        st.write(f"{len(urls)} URLs ditemukan")
 
-        st.write("## 🔒 SSL Check")
-        ssl_result = scanner.check_ssl(domain)
-        st.write(ssl_result)
+        st.write("## ⚡ Scanning")
 
-        st.write("## 🛡️ Headers")
-        headers = scanner.check_headers(url)
-        st.json(headers)
+        findings = []
 
-        st.write("## 💣 Vulnerability Scan")
-        vulnerabilities = exploit.test_sql_injection(url, session)
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as exe:
+            futures = [exe.submit(scan, u) for u in urls]
 
-        if vulnerabilities:
-            st.error(vulnerabilities)
+            for f in as_completed(futures):
+                findings.extend(f.result())
+
+        st.write("## 💣 Vulnerabilities")
+        if findings:
+            for f in findings:
+                st.error(f)
         else:
-            st.success("Aman dari SQL Injection sederhana")
+            st.success("Aman")
 
-        st.write("## 🌐 Extra Info")
+        st.write("## 🔐 Login Test (basic)")
+        login_results = test_login(target)
 
-        # DNS check
-        if dns:
-            try:
-                answers = dns.resolver.resolve(domain, 'A')
-                ips = [str(r) for r in answers]
-                st.write("IP:", ips)
-            except:
-                st.write("DNS lookup gagal")
+        if login_results:
+            st.error(login_results)
         else:
-            st.warning("DNS module tidak tersedia")
-
-        # WHOIS check
-        if whois:
-            try:
-                data = whois.whois(domain)
-                st.write("WHOIS:", data.domain_name)
-            except:
-                st.write("WHOIS gagal")
-        else:
-            st.warning("WHOIS module tidak tersedia")
-
+            st.success("Login aman")
 
 if __name__ == "__main__":
     main()
